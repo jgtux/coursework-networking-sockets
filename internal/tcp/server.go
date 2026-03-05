@@ -1,13 +1,26 @@
 package tcp
 
 import (
-	"errors"
-	"net"
-	"strconv"
-	"sync"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"net"
+	"sync"
+	"fmt"
 )
+
+type ErrReason string
+
+const (
+	ErrServerFull ErrReason = "SERVER_FULL"
+)
+
+// para implementar a interface do error
+func (e ErrReason) Error() string {
+	return string(e)
+}
+
 
 // Clientes aceitos
 type AcceptedClient struct {
@@ -15,42 +28,64 @@ type AcceptedClient struct {
 	Client *Client
 }
 
-// dados do objeto server
+// struct server
 type Server struct {
-	addr string // endereco ip + porta logica do server
-	ln net.Listener // Receptor de novas conexoes
+	addr string
+	ln   net.Listener
 
-	maxClients int // maximo de clientes conectados no server
-	sem chan struct{} // semphore
+	maxClients int // nao pode ser uint
+	sem        chan struct{} // semáforo: 1 slot por cliente conectado
 
-	clients   map[string]*Client // cache de clientes conectados
-	clientsMu sync.RWMutex // Mutex com read-lock para leitura concorrente em hashmaps
+	clients   map[string]*Client
+	clientsMu sync.RWMutex
 
-	accepted chan AcceptedClient // canal de clientes aceitos
-	errs     chan error // canal de erros
+	accepted chan AcceptedClient
+	errs     chan error
 
-	ctx context.Context
+	ctx    context.Context
 	cancel context.CancelFunc
 
-	once   sync.Once // para fechamento do server, usado para somente fechar na primeira chamada do Close(), evitando panics
+	once sync.Once
 }
 
 // inicializador/construtor do server
-func NewServer(addr string) (*Server, error) {
+// maxClients precisa ser > 0
+func NewServer(parent context.Context, addr string, maxClients int) (*Server, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if maxClients <= 0 {
+		return nil, fmt.Errorf("Atleast 1 client slot must be available.")
+	}
+
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 
+	ctx, cancel := context.WithCancel(parent)
+
 	s := &Server{
-		ln:       ln,
+		addr:       addr,
+		ln:         ln,
+		maxClients: maxClients,
+		sem:        make(chan struct{}, maxClients),
+
 		clients:  make(map[string]*Client),
 		accepted: make(chan AcceptedClient, 128),
 		errs:     make(chan error, 1),
-		done:     make(chan struct{}),
+
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
-	go s.acceptLoop() // goroutine para lidar com novas conexoes
+	// quando o ctx cancelar, fecha o listener pra destravar o Accept()
+	go func() {
+		<-s.ctx.Done()
+		_ = s.ln.Close()
+	}()
+
+	go s.acceptLoop()
 
 	return s, nil
 }
@@ -63,8 +98,9 @@ func (s *Server) acceptLoop() {
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
+			// shutdown via ctx cancel + listener fechado
 			select {
-			case <-s.done:
+			case <-s.ctx.Done():
 				return
 			default:
 			}
@@ -80,32 +116,43 @@ func (s *Server) acceptLoop() {
 			return
 		}
 
-		key := s.newClientKey()
 		client := NewClient(conn)
 
+		// tenta pegar 1 slot do semáforo; se cheio, recusa
+		select {
+		case s.sem <- struct{}{}:
+			// ok, tem vaga
+		default:
+			_ = client.SendFrame([]byte(ErrServerFull))
+
+			_ = client.Close()
+			continue
+		}
+
+		key := s.newClientKey()
 		s.clientsMu.Lock()
 		s.clients[key] = client
 		s.clientsMu.Unlock()
 
 		select {
 		case s.accepted <- AcceptedClient{Key: key, Client: client}:
-		case <-s.done:
+		case <-s.ctx.Done():
+			// se está fechando, remove e devolve o slot
 			s.clientsMu.Lock()
 			delete(s.clients, key)
 			s.clientsMu.Unlock()
 			_ = client.Close()
+			<-s.sem
 			return
 		}
 	}
 }
 
-func (s *Server) Accepted() <-chan AcceptedClient {
-	return s.accepted
-}
+// coleta todos os clientes aceitos no canal accepted
+func (s *Server) Accepted() <-chan AcceptedClient { return s.accepted }
 
-func (s *Server) Errors() <-chan error {
-	return s.errs
-}
+// coleta erros do canal error
+func (s *Server) Errors() <-chan error { return s.errs }
 
 // Puxar um client conectado
 func (s *Server) GetClient(key string) (*Client, bool) {
@@ -115,7 +162,7 @@ func (s *Server) GetClient(key string) (*Client, bool) {
 	return client, ok
 }
 
-// Remocao de um client conectado
+// Remocao de um client conectado (IMPORTANTE: devolve 1 slot do semáforo)
 func (s *Server) RemoveClient(key string) {
 	s.clientsMu.Lock()
 	client, ok := s.clients[key]
@@ -126,6 +173,7 @@ func (s *Server) RemoveClient(key string) {
 
 	if ok {
 		_ = client.Close()
+		<-s.sem // devolve o slot
 	}
 }
 
@@ -143,31 +191,44 @@ func (s *Server) BroadcastFrame(payload []byte) {
 	}
 }
 
+// fecha servidor, só executa na primeira chamada (sync.Once)
 func (s *Server) Close() error {
 	var err error
 
 	s.once.Do(func() {
-		close(s.done)
+		s.cancel()
 		err = s.ln.Close()
 
 		s.clientsMu.Lock()
 		clients := make([]*Client, 0, len(s.clients))
-		for _, client := range s.clients {
+		for key, client := range s.clients {
+			_ = key
 			clients = append(clients, client)
 		}
 		s.clients = make(map[string]*Client)
 		s.clientsMu.Unlock()
 
+		for range clients {
+			// vamos fechar abaixo com índice pra liberar sem também
+		}
+
 		for _, client := range clients {
 			_ = client.Close()
+			// libera um slot por cliente que estava conectado
+			select {
+			case <-s.sem:
+			default:
+				// se por algum motivo já foi liberado, não trava
+			}
 		}
 	})
 
 	return err
 }
 
+// gera uma key aleatoria para cada cliente conectado
 func (s *Server) newClientKey() string {
-    var b [8]byte
-    rand.Read(b[:])
-    return hex.EncodeToString(b[:])
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
