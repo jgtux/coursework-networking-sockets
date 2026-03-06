@@ -21,13 +21,6 @@ func (e ErrReason) Error() string {
 	return string(e)
 }
 
-
-// Clientes aceitos
-type AcceptedClient struct {
-	Key    string
-	Client *Client
-}
-
 // struct server
 type Server struct {
 	addr string
@@ -39,7 +32,6 @@ type Server struct {
 	clients   map[string]*Client
 	clientsMu sync.RWMutex
 
-	accepted chan AcceptedClient
 	errs     chan error
 
 	ctx    context.Context
@@ -55,7 +47,7 @@ func NewServer(parent context.Context, addr string, maxClients int) (*Server, er
 		parent = context.Background()
 	}
 	if maxClients <= 0 {
-		return nil, fmt.Errorf("Atleast 1 client slot must be available.")
+		return nil, fmt.Errorf("atleast 1 client slot must be available")
 	}
 
 	ln, err := net.Listen("tcp", addr)
@@ -72,7 +64,6 @@ func NewServer(parent context.Context, addr string, maxClients int) (*Server, er
 		sem:        make(chan struct{}, maxClients),
 
 		clients:  make(map[string]*Client),
-		accepted: make(chan AcceptedClient, 128),
 		errs:     make(chan error, 1),
 
 		ctx:    ctx,
@@ -92,7 +83,6 @@ func NewServer(parent context.Context, addr string, maxClients int) (*Server, er
 
 // loop para lidar com novas conexoes
 func (s *Server) acceptLoop() {
-	defer close(s.accepted)
 	defer close(s.errs)
 
 	for {
@@ -135,21 +125,14 @@ func (s *Server) acceptLoop() {
 		s.clientsMu.Unlock()
 
 		select {
-		case s.accepted <- AcceptedClient{Key: key, Client: client}:
 		case <-s.ctx.Done():
-			// se está fechando, remove e devolve o slot
-			s.clientsMu.Lock()
-			delete(s.clients, key)
-			s.clientsMu.Unlock()
-			_ = client.Close()
-			<-s.sem
+			// se esta fechando, remove e devolve o slot
+			s.RemoveClient(key)
 			return
 		}
 	}
 }
 
-// coleta todos os clientes aceitos no canal accepted
-func (s *Server) Accepted() <-chan AcceptedClient { return s.accepted }
 
 // coleta erros do canal error
 func (s *Server) Errors() <-chan error { return s.errs }
@@ -162,7 +145,7 @@ func (s *Server) GetClient(key string) (*Client, bool) {
 	return client, ok
 }
 
-// Remocao de um client conectado (IMPORTANTE: devolve 1 slot do semáforo)
+// Remocao de um client conectado 
 func (s *Server) RemoveClient(key string) {
 	s.clientsMu.Lock()
 	client, ok := s.clients[key]
@@ -171,11 +154,20 @@ func (s *Server) RemoveClient(key string) {
 	}
 	s.clientsMu.Unlock()
 
-	if ok {
-		_ = client.Close()
-		<-s.sem // devolve o slot
+	if !ok {
+		return
+	}
+
+	_ = client.Close()
+
+	// devolve o slot sem risco de deadlock
+	select {
+	case <-s.sem:
+	default:
+		// já foi devolvido (ou nunca foi tomado) -> não trava
 	}
 }
+
 
 // distribui um frame para todos os clientes conectados
 func (s *Server) BroadcastFrame(payload []byte) {
