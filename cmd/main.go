@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -102,43 +105,85 @@ func runClient(addr string, n int, msg string, every time.Duration, count int, r
 				log.Printf("[client %d] dial error: %v", i, err)
 				return
 			}
-			defer func() { _ = conn.Close() }()
 
 			c := tcp.NewClient(conn)
-
-			// seta timeouts ja na criacao do client (como você quer)
 			c.SetReadTimeout(rto)
 			c.SetWriteTimeout(wto)
 
 			log.Printf("[client %d] connected -> %s (rto=%s wto=%s)", i, addr, rto, wto)
 
-			// goroutine pra ler frames do server (broadcast / server_full / etc)
 			done := make(chan struct{})
+			var mu sync.Mutex
+			serverFull := false
+
+			// goroutine pra ler frames do server (broadcast / server_full / etc)
 			go func() {
 				defer close(done)
+
 				for {
 					p, err := c.ReadFrame()
 					if err != nil {
-						// quando server recusa com SERVER_FULL pode fechar logo após enviar; aqui você vê o erro/EOF
+						if isExpectedClientReadClose(err) {
+							return
+						}
+
+						mu.Lock()
+						sf := serverFull
+						mu.Unlock()
+
+						// se o servidor avisou SERVER_FULL e logo depois fechou/resetou, isso é esperado
+						if sf && isExpectedServerRefusalClose(err) {
+							return
+						}
+
 						log.Printf("[client %d] read error: %v", i, err)
 						return
 					}
+
 					log.Printf("[client %d] <- %q", i, string(p))
+
+					if string(p) == string(tcp.ErrServerFull) {
+						mu.Lock()
+						serverFull = true
+						mu.Unlock()
+					}
 				}
 			}()
 
 			// envia frames periodicamente
 			for k := 0; k < count; k++ {
+				mu.Lock()
+				sf := serverFull
+				mu.Unlock()
+
+				if sf {
+					break
+				}
+
 				payload := []byte(fmt.Sprintf("%s (client=%d seq=%d at=%s)", msg, i, k, time.Now().Format(time.RFC3339)))
 
 				if err := c.SendFrame(payload); err != nil {
+					if isExpectedClientWriteClose(err) {
+						break
+					}
+
+					mu.Lock()
+					sf := serverFull
+					mu.Unlock()
+
+					if sf && isExpectedServerRefusalWrite(err) {
+						break
+					}
+
 					log.Printf("[client %d] send error: %v", i, err)
 					break
 				}
+
 				log.Printf("[client %d] -> %q", i, string(payload))
 				time.Sleep(every)
 			}
 
+			// fecha a conexao e espera o leitor terminar sem poluir o log
 			_ = c.Close()
 			<-done
 			log.Printf("[client %d] done", i)
@@ -146,4 +191,57 @@ func runClient(addr string, n int, msg string, every time.Duration, count int, r
 	}
 
 	wg.Wait()
+}
+
+// helper para erros esperados quando o proprio client fecha a conexao
+func isExpectedClientReadClose(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return true
+	}
+
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection")
+}
+
+// helper para erros esperados quando o servidor recusa e fecha/reset a conexao
+func isExpectedServerRefusalClose(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection reset by peer")
+}
+
+// helper para erros esperados de escrita quando a conexao ja foi fechada pelo proprio client
+func isExpectedClientWriteClose(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection")
+}
+
+// helper para erros esperados de escrita quando o servidor recusou a conexao
+func isExpectedServerRefusalWrite(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset by peer")
 }

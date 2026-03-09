@@ -129,6 +129,7 @@ func (s *Server) acceptLoop() {
 			// se esta fechando, remove e devolve o slot
 			s.RemoveClient(key)
 			return
+		default:
 		}
 	}
 }
