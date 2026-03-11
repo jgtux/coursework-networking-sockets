@@ -13,7 +13,7 @@ import (
 
 // ─── Tipos e estado compartilhado
 
-// Status do motorista
+// DriverStatus motorista livre ou em corrida. (0 = livre / 1 = em corrida)
 type DriverStatus int
 
 const (
@@ -21,7 +21,7 @@ const (
 	StatusOnRide                     // motorista em corrida
 )
 
-// Chamada de passageiro
+// RideCall é uma chamada de passageiro gerada pelo server
 type RideCall struct {
 	ID           int
 	DistToPickup float64 // km até o passageiro
@@ -32,7 +32,8 @@ type RideCall struct {
 	Cancelled    bool
 }
 
-// Estado global compartilhado entre as threads do servidor
+// SharedState é a memória compartilhada do servidor
+// O sync.Mutex garante que apenas uma thread acesse os dados por vez
 type SharedState struct {
 	mu            sync.Mutex
 	status        DriverStatus
@@ -41,16 +42,19 @@ type SharedState struct {
 	currentRideID int
 }
 
+// Estado inicial do servidor
 func NewSharedState() *SharedState {
 	return &SharedState{status: StatusFree}
 }
 
+// Retorna o status atual do motorista
 func (s *SharedState) GetStatus() DriverStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.status
 }
 
+// Atualiza o status do motorista
 func (s *SharedState) SetStatus(st DriverStatus) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
