@@ -26,7 +26,7 @@ func main() {
 	readTO := flag.Duration("rto", 0*time.Second, "read timeout por operacao (0=sem)")
 	writeTO := flag.Duration("wto", 0*time.Second, "write timeout por operacao (0=sem)")
 
-	// opções do client de teste original
+	// opções do client
 	n := flag.Int("n", 1, "numero de clients concorrentes (client mode)")
 	msg := flag.String("msg", "ping", "mensagem para enviar (client mode)")
 	every := flag.Duration("every", 1*time.Second, "intervalo entre envios (client mode)")
@@ -34,7 +34,7 @@ func main() {
 
 	flag.Parse()
 
-	// contexto global — cancelado quando o programa recebe Ctrl+C
+	// contexto global cancelado quando o programa recebe Ctrl+C
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		sigCh := make(chan os.Signal, 1)
@@ -46,7 +46,6 @@ func main() {
 
 	switch *mode {
 	case "uber-server":
-		// passa o limite de motoristas para o servidor
 		if err := app.RunUberServer(ctx, *addr, *maxClients); err != nil {
 			log.Fatalf("uber-server: %v", err)
 		}
@@ -67,7 +66,7 @@ func main() {
 	}
 }
 
-// ─── Modos originais de teste ─────────────────────────────────────────────────
+// Modos de teste
 
 func runServer(ctx context.Context, addr string, maxClients int, rto, wto time.Duration) {
 	srv, err := tcp.NewServer(ctx, addr, maxClients)
@@ -189,7 +188,7 @@ func runClient(addr string, n int, msg string, every time.Duration, count int, r
 	wg.Wait()
 }
 
-// ─── Helpers de erro (sem alteração) ─────────────────────────────────────────
+// Helpers de erro
 
 func isExpectedClientReadClose(err error) bool {
 	if err == nil {

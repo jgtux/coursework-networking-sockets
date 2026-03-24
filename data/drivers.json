@@ -1,7 +1,17 @@
 {
+  "Athena": {
+    "name": "Athena",
+    "total_earned": 52.47042946072751,
+    "last_seen": "2026-03-24T19:44:17.1489557-03:00"
+  },
+  "Capeta": {
+    "name": "Maverick",
+    "total_earned": 0,
+    "last_seen": "2026-03-24T19:42:18.2690934-03:00"
+  },
   "Haroldo": {
     "name": "Haroldo",
-    "total_earned": 108.70013497466346,
-    "last_seen": "2026-03-23T20:59:45.14357-03:00"
+    "total_earned": 131.4074572556903,
+    "last_seen": "2026-03-24T19:44:02.6210034-03:00"
   }
 }

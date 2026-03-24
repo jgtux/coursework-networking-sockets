@@ -14,12 +14,13 @@ import (
 // RunUberClient é o ponto de entrada do cliente, chamado pelo main.
 // Conecta ao servidor e gerencia as duas threads da sessão.
 func RunUberClient(ctx context.Context, addr string) error {
-	// abre a conexão TCP com o servidor
+	// net.Dial abre a conexão TCP com o servidor
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("erro ao conectar em %s: %w", addr, err)
 	}
 
+	// tcp.NewClient envolve a conexão com a camada de framing do pacote tcp
 	client := tcp.NewClient(conn)
 	defer client.Close()
 
@@ -29,23 +30,22 @@ func RunUberClient(ctx context.Context, addr string) error {
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
 
-	// Thread 2: fica em loop recebendo mensagens do servidor e imprimindo na tela.
-	// Roda em segundo plano para não bloquear o input do teclado.
+	// Thread 2: recebe mensagens do servidor e imprime na tela de forma assíncrona
 	go thread2Receiver(sessCtx, client, sessCancel)
 
-	// Thread 1: lê comandos do teclado e os envia ao servidor.
-	// O primeiro envio é sempre o nome do usuário (identificação).
+	// Thread 1: lê comandos do teclado e os envia ao servidor
+	// o primeiro envio é sempre o nome do usuário
 	thread1Input(sessCtx, client, sessCancel)
 
 	return nil
 }
 
 // thread1Input lê o teclado e envia dados ao servidor em loop infinito.
-// O primeiro dado enviado é sempre o nome do motorista.
+// O primeiro dado enviado é sempre o nome do motorista (identificação).
 func thread1Input(ctx context.Context, client *tcp.Client, cancel context.CancelFunc) {
 	scanner := bufio.NewScanner(os.Stdin)
 
-	// passo 1: pede o nome de usuário antes de mostrar os comandos
+	// passo 1: identifica o motorista antes de mostrar os comandos
 	fmt.Print("Nome de usuário: ")
 	if !scanner.Scan() {
 		cancel()
@@ -59,15 +59,14 @@ func thread1Input(ctx context.Context, client *tcp.Client, cancel context.Cancel
 		return
 	}
 
-	// envia o nome ao servidor para identificação
+	// envia o nome ao servidor para identificação e verificação de duplicidade
 	if err := client.SendFrame([]byte(name)); err != nil {
 		fmt.Printf("[ERRO] Falha ao enviar nome: %v\n", err)
 		cancel()
 		return
 	}
 
-	// aguarda um momento para o servidor processar e enviar as mensagens de boas-vindas
-	// antes de exibir o menu (as mensagens chegam pela Thread 2)
+	// exibe o menu de comandos disponíveis
 	printHelp()
 
 	// passo 2: loop normal de comandos
@@ -110,8 +109,8 @@ func thread1Input(ctx context.Context, client *tcp.Client, cancel context.Cancel
 }
 
 // thread2Receiver recebe mensagens do servidor e as imprime na tela de forma assíncrona.
-// Isso permite que notificações de novas chamadas apareçam mesmo enquanto
-// o motorista não está digitando nada.
+// Permite que notificações de novas chamadas apareçam mesmo enquanto o motorista
+// não está digitando nada.
 func thread2Receiver(ctx context.Context, client *tcp.Client, cancel context.CancelFunc) {
 	for {
 		select {
@@ -138,7 +137,7 @@ func thread2Receiver(ctx context.Context, client *tcp.Client, cancel context.Can
 }
 
 // parseCommand valida o comando digitado.
-// Retorna o comando em minúsculas ou string vazia se for inválido.
+// Retorna o comando em minúsculas ou string vazia se inválido.
 func parseCommand(input string) string {
 	lower := strings.ToLower(strings.TrimSpace(input))
 
