@@ -22,7 +22,7 @@ import (
 func main() {
 	mode := flag.String("mode", "server", "server|client|uber-server|uber-client")
 	addr := flag.String("addr", "127.0.0.1:9000", "ip:porta")
-	maxClients := flag.Int("max", 2, "max clients (server)")
+	maxClients := flag.Int("max", 5, "max motoristas simultâneos (uber-server)")
 	readTO := flag.Duration("rto", 0*time.Second, "read timeout por operacao (0=sem)")
 	writeTO := flag.Duration("wto", 0*time.Second, "write timeout por operacao (0=sem)")
 
@@ -34,7 +34,7 @@ func main() {
 
 	flag.Parse()
 
-	// contexto global com cancelamento por sinal (Ctrl+C)
+	// contexto global — cancelado quando o programa recebe Ctrl+C
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		sigCh := make(chan os.Signal, 1)
@@ -46,7 +46,8 @@ func main() {
 
 	switch *mode {
 	case "uber-server":
-		if err := app.RunUberServer(ctx, *addr); err != nil {
+		// passa o limite de motoristas para o servidor
+		if err := app.RunUberServer(ctx, *addr, *maxClients); err != nil {
 			log.Fatalf("uber-server: %v", err)
 		}
 
@@ -66,7 +67,7 @@ func main() {
 	}
 }
 
-// ─── Modos originais de teste (sem alteração) ────────────────────────────────
+// ─── Modos originais de teste ─────────────────────────────────────────────────
 
 func runServer(ctx context.Context, addr string, maxClients int, rto, wto time.Duration) {
 	srv, err := tcp.NewServer(ctx, addr, maxClients)
