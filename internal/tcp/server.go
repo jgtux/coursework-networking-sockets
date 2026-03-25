@@ -5,9 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
-	"fmt"
 )
 
 type ErrReason string
@@ -26,13 +26,13 @@ type Server struct {
 	addr string
 	ln   net.Listener
 
-	maxClients int // nao pode ser uint
+	maxClients int           // nao pode ser uint
 	sem        chan struct{} // semáforo: 1 slot por cliente conectado
 
 	clients   map[string]*Client
 	clientsMu sync.RWMutex
 
-	errs     chan error
+	errs chan error
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -62,12 +62,10 @@ func NewServer(parent context.Context, addr string, maxClients int) (*Server, er
 		ln:         ln,
 		maxClients: maxClients,
 		sem:        make(chan struct{}, maxClients),
-
-		clients:  make(map[string]*Client),
-		errs:     make(chan error, 1),
-
-		ctx:    ctx,
-		cancel: cancel,
+		clients:    make(map[string]*Client),
+		errs:       make(chan error, 1),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 
 	// quando o ctx cancelar, fecha o listener pra destravar o Accept()
@@ -88,7 +86,6 @@ func (s *Server) acceptLoop() {
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
-			// shutdown via ctx cancel + listener fechado
 			select {
 			case <-s.ctx.Done():
 				return
@@ -114,7 +111,6 @@ func (s *Server) acceptLoop() {
 			// ok, tem vaga
 		default:
 			_ = client.SendFrame([]byte(ErrServerFull))
-
 			_ = client.Close()
 			continue
 		}
@@ -126,7 +122,6 @@ func (s *Server) acceptLoop() {
 
 		select {
 		case <-s.ctx.Done():
-			// se esta fechando, remove e devolve o slot
 			s.RemoveClient(key)
 			return
 		default:
@@ -134,11 +129,10 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-
-// coleta erros do canal error
+// Errors retorna o canal de erros internos do servidor
 func (s *Server) Errors() <-chan error { return s.errs }
 
-// Puxar um client conectado
+// GetClient retorna um cliente pelo seu identificador interno
 func (s *Server) GetClient(key string) (*Client, bool) {
 	s.clientsMu.RLock()
 	client, ok := s.clients[key]
@@ -146,7 +140,7 @@ func (s *Server) GetClient(key string) (*Client, bool) {
 	return client, ok
 }
 
-// Remocao de um client conectado 
+// RemoveClient remove um cliente do mapa e fecha sua conexão, devolvendo o slot do semáforo
 func (s *Server) RemoveClient(key string) {
 	s.clientsMu.Lock()
 	client, ok := s.clients[key]
@@ -161,16 +155,13 @@ func (s *Server) RemoveClient(key string) {
 
 	_ = client.Close()
 
-	// devolve o slot sem risco de deadlock
 	select {
 	case <-s.sem:
 	default:
-		// já foi devolvido (ou nunca foi tomado) -> não trava
 	}
 }
 
-
-// distribui um frame para todos os clientes conectados
+// BroadcastFrame envia um frame para todos os clientes conectados
 func (s *Server) BroadcastFrame(payload []byte) {
 	s.clientsMu.RLock()
 	clients := make([]*Client, 0, len(s.clients))
@@ -184,7 +175,20 @@ func (s *Server) BroadcastFrame(payload []byte) {
 	}
 }
 
-// fecha servidor, só executa na primeira chamada (sync.Once)
+// RangeClients itera sobre os clientes conectados de forma thread-safe.
+// Retorne false na função fn para parar a iteração.
+func (s *Server) RangeClients(fn func(key string, c *Client) bool) {
+	s.clientsMu.RLock()
+	defer s.clientsMu.RUnlock()
+
+	for k, c := range s.clients {
+		if !fn(k, c) {
+			return
+		}
+	}
+}
+
+// Close encerra o servidor — só executa na primeira chamada (sync.Once)
 func (s *Server) Close() error {
 	var err error
 
@@ -194,24 +198,17 @@ func (s *Server) Close() error {
 
 		s.clientsMu.Lock()
 		clients := make([]*Client, 0, len(s.clients))
-		for key, client := range s.clients {
-			_ = key
+		for _, client := range s.clients {
 			clients = append(clients, client)
 		}
 		s.clients = make(map[string]*Client)
 		s.clientsMu.Unlock()
 
-		for range clients {
-			// vamos fechar abaixo com índice pra liberar sem também
-		}
-
 		for _, client := range clients {
 			_ = client.Close()
-			// libera um slot por cliente que estava conectado
 			select {
 			case <-s.sem:
 			default:
-				// se por algum motivo já foi liberado, não trava
 			}
 		}
 	})

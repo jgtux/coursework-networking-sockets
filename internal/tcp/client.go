@@ -14,8 +14,8 @@ import (
 // timeouts padrao por operacao (0 = sem timeout)
 // max tamanho de frame padrao
 const (
-	DefaultReadTimeout  = 0 * time.Second
-	DefaultWriteTimeout = 0 * time.Second
+	DefaultReadTimeout         = 0 * time.Second
+	DefaultWriteTimeout        = 0 * time.Second
 	DefaultMaxFrameSize uint32 = 1 << 20 // 1 MiB
 )
 
@@ -134,8 +134,7 @@ func (c *Client) RemoteAddr() net.Addr {
 	return c.conn.RemoteAddr()
 }
 
-// helper para garantir escrita completa no writer
-// continua escrevendo ate consumir todo o buffer ou ocorrer erro
+// helper para garantir escrita completa no writer continua escrevendo ate consumir todo o buffer ou ocorrer erro
 func writeFull(w io.Writer, p []byte) error {
 	for len(p) > 0 {
 		n, err := w.Write(p)
