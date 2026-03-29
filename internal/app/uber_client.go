@@ -131,9 +131,10 @@ func recvLoop(ctx context.Context, client *tcp.Client, cancel context.CancelFunc
 }
 
 func parseCommand(input string) string {
+	lower := strings.ToLower(strings.TrimSpace(input))
 	switch strings.ToLower(strings.TrimSpace(input)) {
 	case ":accept", ":start", ":finish", ":cancel", ":status", ":quit":
-		return strings.ToLower(strings.TrimSpace(input))
+		return lower
 	default:
 		return ""
 	}
