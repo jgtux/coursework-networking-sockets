@@ -21,6 +21,12 @@ func (e ErrReason) Error() string {
 	return string(e)
 }
 
+type AcceptedClient struct {
+	Key    string
+	Client *Client
+}
+
+
 // struct server
 type Server struct {
 	addr string
@@ -33,6 +39,8 @@ type Server struct {
 	clientsMu sync.RWMutex
 
 	errs chan error
+	accepted chan AcceptedClient
+
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -64,6 +72,7 @@ func NewServer(parent context.Context, addr string, maxClients int) (*Server, er
 		sem:        make(chan struct{}, maxClients),
 		clients:    make(map[string]*Client),
 		errs:       make(chan error, 1),
+		accepted:   make(chan AcceptedClient, maxClients),
 		ctx:        ctx,
 		cancel:     cancel,
 	}
@@ -82,6 +91,7 @@ func NewServer(parent context.Context, addr string, maxClients int) (*Server, er
 // loop para lidar com novas conexoes
 func (s *Server) acceptLoop() {
 	defer close(s.errs)
+	defer close(s.accepted)
 
 	for {
 		conn, err := s.ln.Accept()
@@ -121,13 +131,15 @@ func (s *Server) acceptLoop() {
 		s.clientsMu.Unlock()
 
 		select {
+		case s.accepted <- AcceptedClient{Key: key, Client: client}:
 		case <-s.ctx.Done():
 			s.RemoveClient(key)
 			return
-		default:
 		}
 	}
 }
+
+func (s *Server) Accepted() <-chan AcceptedClient { return s.accepted }
 
 // Errors retorna o canal de erros internos do servidor
 func (s *Server) Errors() <-chan error { return s.errs }
