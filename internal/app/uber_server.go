@@ -208,7 +208,7 @@ type DriverSession struct {
 	currentCall *Call
 }
 
-// Server
+// Server struct
 type UberServer struct {
 	mu         sync.Mutex
 	store      *DriverStore
@@ -217,6 +217,8 @@ type UberServer struct {
 	activeCall *Call
 }
 
+
+// Init Uber server
 func RunUberServer(ctx context.Context, addr string, maxClients int) error {
 	store, err := loadStore()
 	if err != nil {
@@ -265,6 +267,7 @@ func RunUberServer(ctx context.Context, addr string, maxClients int) error {
 	}
 }
 
+// Func para cuidar de cada sessao de um motorista
 func (us *UberServer) handleSession(ctx context.Context, srv *tcp.Server, key string, client *tcp.Client) {
 	defer srv.RemoveClient(key)
 
@@ -338,6 +341,7 @@ func (us *UberServer) handleSession(ctx context.Context, srv *tcp.Server, key st
 	}
 }
 
+// Remove uma sessao
 func (us *UberServer) removeSession(session *DriverSession) {
 	us.mu.Lock()
 	defer us.mu.Unlock()
@@ -361,6 +365,7 @@ func (us *UberServer) removeSession(session *DriverSession) {
 	}
 }
 
+// Cuida dos casos de comandos por sessao
 func (us *UberServer) handleCommand(session *DriverSession, cmd string) bool {
 	switch cmd {
 	case ":accept":
@@ -441,6 +446,8 @@ func (us *UberServer) handleCommand(session *DriverSession, cmd string) bool {
 		return true
 	}
 }
+
+// Comandos
 
 func (us *UberServer) acceptCall(session *DriverSession) (*Call, string) {
 	us.mu.Lock()
