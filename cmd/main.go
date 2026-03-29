@@ -86,6 +86,18 @@ func runServer(ctx context.Context, addr string, maxClients int, rto, wto time.D
 		}
 	}()
 
+go func() {
+		for ac := range srv.Accepted() {
+			if rto > 0 {
+				ac.Client.SetReadTimeout(rto)
+			}
+			if wto > 0 {
+				ac.Client.SetWriteTimeout(wto)
+			}
+			log.Printf("[server] accepted client key=%s addr=%s", ac.Key, ac.Client.RemoteAddr())
+		}
+	}()
+
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 

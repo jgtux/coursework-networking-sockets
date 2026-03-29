@@ -2,43 +2,32 @@ package app
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"math/rand"
-	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"coursework-networking-sockets/internal/tcp"
 )
 
-// FSM: Estados da sessão do motorista
 
-// SessionState representa cada estado possível na máquina de estados da sessão.
+// Maquina de estados finita (FSM)
 type SessionState int
 
 const (
-	// StateWaitingName: conexão aberta, aguardando o motorista digitar o nome
-	StateWaitingName SessionState = iota
-
-	// StateIdle: motorista livre, sem chamada ativa
-	StateIdle
-
-	// StateCallPending: uma chamada foi enviada ao motorista, aguardando :accept
+	StateIdle SessionState = iota
 	StateCallPending
-
-	// StateAccepted: motorista aceitou a chamada, aguardando :start
 	StateAccepted
-
-	// StateStarted: corrida em andamento, aguardando :finish
 	StateStarted
 )
 
 func (s SessionState) String() string {
 	switch s {
-	case StateWaitingName:
-		return "AGUARDANDO IDENTIFICAÇÃO"
 	case StateIdle:
 		return "LIVRE"
 	case StateCallPending:
@@ -52,294 +41,282 @@ func (s SessionState) String() string {
 	}
 }
 
-// Salvando dados do motoristas em JSON
 
-const dataDir = "data"
-const dataFile = "data/drivers.json"
+// Armazenamento dos dados dos motoristas com sqlite
+// colocar .env
+const (
+	dataDir = "data"
+	dataFile = "data/drivers.db"
+)
 
 type DriverRecord struct {
-	Name        string    `json:"name"`
-	TotalEarned float64   `json:"total_earned"`
-	LastSeen    time.Time `json:"last_seen"`
+	Name        string
+	TotalEarned float64
+	LastSeen    time.Time
 }
 
 type DriverStore struct {
-	mu      sync.Mutex
-	records map[string]*DriverRecord
+	db *sql.DB
 }
 
 func loadStore() (*DriverStore, error) {
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("erro ao criar pasta data: %w", err)
 	}
 
-	store := &DriverStore{records: make(map[string]*DriverRecord)}
-
-	data, err := os.ReadFile(dataFile)
-	if os.IsNotExist(err) {
-		return store, nil
-	}
+	db, err := sql.Open("sqlite", dataFile)
 	if err != nil {
-		return nil, fmt.Errorf("erro ao ler arquivo de dados: %w", err)
+		return nil, fmt.Errorf("erro ao abrir banco sqlite: %w", err)
 	}
 
-	if err := json.Unmarshal(data, &store.records); err != nil {
-		return nil, fmt.Errorf("erro ao interpretar JSON: %w", err)
+	ds := &DriverStore{db: db}
+
+	if err := ds.init(); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 
-	return store, nil
+	return ds, nil
 }
 
-func (ds *DriverStore) save() error {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
+func (ds *DriverStore) init() error {
+	const schema = `
+	CREATE TABLE IF NOT EXISTS drivers (
+		name TEXT PRIMARY KEY,
+		total_earned REAL NOT NULL DEFAULT 0,
+		last_seen TEXT NOT NULL
+	);`
 
-	data, err := json.MarshalIndent(ds.records, "", "  ")
+	if _, err := ds.db.Exec(schema); err != nil {
+		return fmt.Errorf("erro ao criar schema sqlite: %w", err)
+	}
+
+	return nil
+}
+
+func (ds *DriverStore) Close() error {
+	if ds == nil || ds.db == nil {
+		return nil
+	}
+	return ds.db.Close()
+}
+
+func (ds *DriverStore) getDriver(name string) (DriverRecord, error) {
+	var rec DriverRecord
+	var lastSeenRaw string
+
+	err := ds.db.QueryRow(`
+		SELECT name, total_earned, last_seen
+		FROM drivers
+		WHERE name = ?
+	`, name).Scan(&rec.Name, &rec.TotalEarned, &lastSeenRaw)
 	if err != nil {
-		return fmt.Errorf("erro ao serializar JSON: %w", err)
+		if err == sql.ErrNoRows {
+			return DriverRecord{}, fmt.Errorf("motorista %q não encontrado", name)
+		}
+		return DriverRecord{}, fmt.Errorf("erro ao buscar motorista: %w", err)
 	}
 
-	return os.WriteFile(dataFile, data, 0644)
-}
-
-func (ds *DriverStore) getOrCreate(name string) *DriverRecord {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-
-	record, exists := ds.records[name]
-	if !exists {
-		record = &DriverRecord{Name: name, TotalEarned: 0, LastSeen: time.Now()}
-		ds.records[name] = record
+	t, err := time.Parse(time.RFC3339Nano, lastSeenRaw)
+	if err != nil {
+		return DriverRecord{}, fmt.Errorf("erro ao converter last_seen: %w", err)
 	}
-	return record
+	rec.LastSeen = t
+
+	return rec, nil
 }
 
-func (ds *DriverStore) addEarnings(name string, value float64) error {
-	ds.mu.Lock()
-	record, exists := ds.records[name]
-	if !exists {
-		ds.mu.Unlock()
-		return fmt.Errorf("motorista %q não encontrado", name)
+func (ds *DriverStore) ensureDriver(name string) (DriverRecord, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	_, err := ds.db.Exec(`
+		INSERT INTO drivers (name, total_earned, last_seen)
+		VALUES (?, 0, ?)
+		ON CONFLICT(name) DO NOTHING
+	`, name, now)
+	if err != nil {
+		return DriverRecord{}, fmt.Errorf("erro ao garantir motorista: %w", err)
 	}
-	record.TotalEarned += value
-	record.LastSeen = time.Now()
-	ds.mu.Unlock()
 
-	return ds.save()
+	return ds.getDriver(name)
 }
 
-// Chamada global de passageiro
+func (ds *DriverStore) totalEarned(name string) float64 {
+	var total float64
 
-// GlobalCall representa uma chamada ativa no sistema.
-// É compartilhada entre todos os motoristas — apenas um pode aceitar.
-type GlobalCall struct {
-	mu           sync.Mutex
+	err := ds.db.QueryRow(`
+		SELECT total_earned
+		FROM drivers
+		WHERE name = ?
+	`, name).Scan(&total)
+	if err != nil {
+		return 0
+	}
+
+	return total
+}
+
+func (ds *DriverStore) addEarnings(name string, value float64) (float64, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	res, err := ds.db.Exec(`
+		UPDATE drivers
+		SET total_earned = total_earned + ?, last_seen = ?
+		WHERE name = ?
+	`, value, now, name)
+	if err != nil {
+		return 0, fmt.Errorf("erro ao atualizar ganhos: %w", err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("erro ao verificar linhas afetadas: %w", err)
+	}
+	if rows == 0 {
+		return 0, fmt.Errorf("motorista %q não encontrado", name)
+	}
+
+	var total float64
+	err = ds.db.QueryRow(`
+		SELECT total_earned
+		FROM drivers
+		WHERE name = ?
+	`, name).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("erro ao buscar faturamento atualizado: %w", err)
+	}
+
+	return total, nil
+}
+
+// Chamada pra corrida
+type Call struct {
 	ID           int
 	DistToPickup float64
 	RideDistance float64
 	Value        float64
 	ExpiresAt    time.Time
-	// takenBy guarda o nome do motorista que aceitou.
-	// string vazia = ninguém aceitou ainda.
-	takenBy string
 }
 
-// tryTake tenta reservar a corrida para o motorista informado.
-// Retorna true se conseguiu (foi o primeiro a aceitar).
-// Retorna false se outro motorista já tinha aceitado.
-func (gc *GlobalCall) tryTake(driverName string) bool {
-	gc.mu.Lock()
-	defer gc.mu.Unlock()
 
-	if gc.takenBy != "" {
-		// já foi aceita por outro motorista
-		return false
-	}
-
-	gc.takenBy = driverName
-	return true
-}
-
-func (gc *GlobalCall) isTaken() bool {
-	gc.mu.Lock()
-	defer gc.mu.Unlock()
-	return gc.takenBy != ""
-}
-
-// Sessão do motorista (FSM)
-
+// Sessao de um motorista
 type DriverSession struct {
-	mu     sync.Mutex
-	state  SessionState
-	name   string
-	record *DriverRecord
-	client *tcp.Client
-	// currentCall aponta para a GlobalCall que está associada a esta sessão.
-	// É nil quando o motorista está em StateIdle ou StateWaitingName.
-	currentCall *GlobalCall
+	serverKey   string
+	name        string
+	state       SessionState
+	client      *tcp.Client
+	currentCall *Call
 }
 
-func newDriverSession(client *tcp.Client) *DriverSession {
-	return &DriverSession{
-		state:  StateWaitingName,
-		client: client,
-	}
-}
-
-func (ds *DriverSession) transition(next SessionState) {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	ds.state = next
-}
-
-func (ds *DriverSession) getState() SessionState {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	return ds.state
-}
-
-func (ds *DriverSession) getCurrentCall() *GlobalCall {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	return ds.currentCall
-}
-
-func (ds *DriverSession) setCurrentCall(call *GlobalCall) {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	ds.currentCall = call
-}
-
-func (ds *DriverSession) getTotalEarned() float64 {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	return ds.record.TotalEarned
-}
-
-//UberServer
-
-// UberServer gerencia todas as sessões e a Thread 2 global.
+// Server
 type UberServer struct {
-	store       *DriverStore
-	sessions    sync.Map // nome → *DriverSession
-	counterMu   sync.Mutex
-	callCounter int
-
-	// activeCall é a chamada global atual sendo disputada pelos motoristas.
-	// É nil quando não há chamada ativa no momento.
-	activeCallMu sync.Mutex
-	activeCall   *GlobalCall
+	mu         sync.Mutex
+	store      *DriverStore
+	sessions   map[string]*DriverSession // nome -> sessão
+	nextCallID int
+	activeCall *Call
 }
 
-// RunUberServer é o ponto de entrada do servidor.
 func RunUberServer(ctx context.Context, addr string, maxClients int) error {
 	store, err := loadStore()
 	if err != nil {
 		return fmt.Errorf("erro ao carregar dados: %w", err)
 	}
 
-	sem := make(chan struct{}, maxClients)
-
-	ln, err := net.Listen("tcp", addr)
+	srv, err := tcp.NewServer(ctx, addr, maxClients)
 	if err != nil {
-		return fmt.Errorf("erro ao abrir listener: %w", err)
+		return fmt.Errorf("erro ao iniciar servidor TCP: %w", err)
 	}
-	defer ln.Close()
+	defer srv.Close()
 
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
+	us := &UberServer{
+		store:    store,
+		sessions: make(map[string]*DriverSession),
+	}
 
-	us := &UberServer{store: store}
-
-	// Thread 2 global: go routine que gera e distribui chamadas para todos os motoristas livres simultaneamente
-	go us.thread2GlobalEventGenerator(ctx)
+	go us.eventLoop(ctx)
 
 	fmt.Printf("[SERVER] Aguardando conexões em %s (max %d motoristas)...\n", addr, maxClients)
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-				return fmt.Errorf("erro ao aceitar conexão: %w", err)
-			}
-		}
+	errs := srv.Errors()
+	accepted := srv.Accepted()
 
+	for {
 		select {
-		case sem <- struct{}{}:
-			go func() {
-				defer func() { <-sem }()
-				client := tcp.NewClient(conn)
-				us.handleSession(ctx, client)
-			}()
-		default:
-			tmp := tcp.NewClient(conn)
-			sendMsg(tmp, "[SERVIDOR] Limite de motoristas atingido. Tente novamente mais tarde.")
-			tmp.Close()
+		case <-ctx.Done():
+			return nil
+
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("erro interno do servidor TCP: %w", err)
+			}
+
+		case ac, ok := <-accepted:
+			if !ok {
+				accepted = nil
+				continue
+			}
+			go us.handleSession(ctx, srv, ac.Key, ac.Client)
 		}
 	}
 }
 
-// handleSession gerencia o ciclo de vida de um motorista conectado.
-func (us *UberServer) handleSession(ctx context.Context, client *tcp.Client) {
-	defer client.Close()
+func (us *UberServer) handleSession(ctx context.Context, srv *tcp.Server, key string, client *tcp.Client) {
+	defer srv.RemoveClient(key)
 
-	session := newDriverSession(client)
-
-	// Transição: StateWaitingName para StateIdle
 	sendMsg(client, "Digite seu nome de usuário:")
 
-	nameFrame, err := client.ReadFrame()
+	frame, err := client.ReadFrame()
 	if err != nil {
 		return
 	}
 
-	name := string(nameFrame)
+	name := strings.TrimSpace(string(frame))
 	if name == "" {
 		sendMsg(client, "[ERRO] Nome inválido. Desconectando.")
 		return
 	}
 
-	if _, taken := us.sessions.Load(name); taken {
-		sendMsg(client, fmt.Sprintf("[ERRO] O nome %q já está em uso. Desconectando.", name))
+	rec, err := us.store.ensureDriver(name)
+	if err != nil {
+		sendMsg(client, "[ERRO] Falha ao carregar dados do motorista.")
 		return
 	}
 
-	session.name = name
-	session.record = us.store.getOrCreate(name)
+	session := &DriverSession{
+		serverKey: key,
+		name:      name,
+		state:     StateIdle,
+		client:    client,
+	}
 
-	us.sessions.Store(name, session)
-	defer us.sessions.Delete(name)
+	us.mu.Lock()
+	if _, exists := us.sessions[name]; exists {
+		us.mu.Unlock()
+		sendMsg(client, fmt.Sprintf("[ERRO] O nome %q já está em uso. Desconectando.", name))
+		return
+	}
+	us.sessions[name] = session
+	us.mu.Unlock()
 
-	session.transition(StateIdle)
+	defer us.removeSession(session)
 
-	fmt.Printf("[SERVER] Motorista %q conectado! [%s]\n", name, time.Now().Format("15:04:05"))
+	fmt.Printf("[SERVER] Motorista %q conectado de %s [%s]\n",
+		name, client.RemoteAddr(), time.Now().Format("15:04:05"))
 
 	now := time.Now().Format("15:04:05")
 	sendMsg(client, fmt.Sprintf("[%s]: CONECTADO!!", now))
-	if session.record.TotalEarned == 0 {
+	if rec.TotalEarned == 0 {
 		sendMsg(client, fmt.Sprintf("[INFO] Bem-vindo, %s! Saldo inicial: R$ 0,00", name))
 	} else {
 		sendMsg(client, fmt.Sprintf("[INFO] Bem-vindo de volta, %s! Faturamento total: R$ %.2f",
-			name, session.record.TotalEarned))
+			name, rec.TotalEarned))
 	}
 
-	sessCtx, sessCancel := context.WithCancel(ctx)
-	defer sessCancel()
-
-	// Thread 1 dedicada ao motorista: processa seus comandos
-	go us.thread1Commands(sessCtx, client, session, sessCancel)
-
-	<-sessCtx.Done()
-	fmt.Printf("[SERVER] Motorista %q desconectou.\n", name)
-}
-
-// thread1Commands processa comandos do motorista e dispara transições na FSM.
-func (us *UberServer) thread1Commands(ctx context.Context, client *tcp.Client, session *DriverSession, cancel context.CancelFunc) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -349,136 +326,229 @@ func (us *UberServer) thread1Commands(ctx context.Context, client *tcp.Client, s
 
 		frame, err := client.ReadFrame()
 		if err != nil {
-			fmt.Printf("[SERVER] Motorista %q desconectou inesperadamente.\n", session.name)
-			cancel()
+			fmt.Printf("[SERVER] Motorista %q desconectou.\n", name)
 			return
 		}
 
-		us.handleCommand(string(frame), client, session, cancel)
+		cmd := strings.TrimSpace(string(frame))
+		if keep := us.handleCommand(session, cmd); !keep {
+			fmt.Printf("[SERVER] Motorista %q desconectou.\n", name)
+			return
+		}
 	}
 }
 
-// handleCommand executa o comando respeitando as transições válidas da FSM.
-func (us *UberServer) handleCommand(cmd string, client *tcp.Client, session *DriverSession, cancel context.CancelFunc) {
-	state := session.getState()
+func (us *UberServer) removeSession(session *DriverSession) {
+	us.mu.Lock()
+	defer us.mu.Unlock()
 
+	delete(us.sessions, session.name)
+
+	if us.activeCall == nil {
+		return
+	}
+
+	stillPending := false
+	for _, s := range us.sessions {
+		if s.state == StateCallPending && s.currentCall == us.activeCall {
+			stillPending = true
+			break
+		}
+	}
+
+	if !stillPending {
+		us.activeCall = nil
+	}
+}
+
+func (us *UberServer) handleCommand(session *DriverSession, cmd string) bool {
 	switch cmd {
-
 	case ":accept":
-		// transição válida: StateCallPending → StateAccepted
-		// mas só se conseguir reservar a corrida (tryTake)
-		if state != StateCallPending {
-			sendMsg(client, "[RESPOSTA] Nenhuma chamada pendente para aceitar.")
-			return
+		call, msg := us.acceptCall(session)
+		if msg != "" {
+			sendMsg(session.client, "[RESPOSTA] "+msg)
+			return true
 		}
-
-		call := session.getCurrentCall()
-		if call == nil {
-			// chamada foi cancelada por timeout antes de aceitar
-			session.transition(StateIdle)
-			sendMsg(client, "[RESPOSTA] A chamada expirou antes de ser aceita.")
-			return
-		}
-
-		if time.Now().After(call.ExpiresAt) {
-			session.transition(StateIdle)
-			session.setCurrentCall(nil)
-			sendMsg(client, "[RESPOSTA] Tempo esgotado para aceitar esta chamada.")
-			return
-		}
-
-		// disputa: tenta ser o primeiro a aceitar
-		if !call.tryTake(session.name) {
-			// outro motorista aceitou primeiro — volta para IDLE silenciosamente
-			session.setCurrentCall(nil)
-			session.transition(StateIdle)
-			return
-		}
-
-		// conseguiu — avança para StateAccepted
-		session.transition(StateAccepted)
-
-		sendMsg(client, fmt.Sprintf("[CONFIRMAÇÃO] Você executou: ACEITAR CORRIDA #%d", call.ID))
-		sendMsg(client, fmt.Sprintf("[INFO] Corrida aceita! Dirija %.1f km até o passageiro. Corrida: %.1f km | Valor: R$ %.2f",
-			call.DistToPickup, call.RideDistance, call.Value))
-		sendMsg(client, "[INFO] Use :start quando chegar ao passageiro.")
+		sendMsg(session.client, fmt.Sprintf("[CONFIRMAÇÃO] Você executou: ACEITAR CORRIDA #%d", call.ID))
+		sendMsg(session.client, fmt.Sprintf(
+			"[INFO] Corrida aceita! Dirija %.1f km até o passageiro. Corrida: %.1f km | Valor: R$ %.2f",
+			call.DistToPickup, call.RideDistance, call.Value,
+		))
+		sendMsg(session.client, "[INFO] Use :start quando chegar ao passageiro.")
+		return true
 
 	case ":start":
-		// transição válida: StateAccepted → StateStarted
-		if state != StateAccepted {
-			sendMsg(client, "[RESPOSTA] Nenhuma corrida aceita para iniciar. Use :accept primeiro.")
-			return
+		call, msg := us.startRide(session)
+		if msg != "" {
+			sendMsg(session.client, "[RESPOSTA] "+msg)
+			return true
 		}
-
-		call := session.getCurrentCall()
-		session.transition(StateStarted)
-
-		sendMsg(client, fmt.Sprintf("[CONFIRMAÇÃO] Você executou: INICIAR CORRIDA #%d", call.ID))
-		sendMsg(client, fmt.Sprintf("[INFO] Corrida iniciada! Percurso de %.1f km. Use :finish ao chegar ao destino.", call.RideDistance))
+		sendMsg(session.client, fmt.Sprintf("[CONFIRMAÇÃO] Você executou: INICIAR CORRIDA #%d", call.ID))
+		sendMsg(session.client, fmt.Sprintf(
+			"[INFO] Corrida iniciada! Percurso de %.1f km. Use :finish ao chegar ao destino.",
+			call.RideDistance,
+		))
+		return true
 
 	case ":finish":
-		// transição válida: StateStarted → StateIdle
-		if state != StateStarted {
-			sendMsg(client, "[RESPOSTA] Nenhuma corrida em andamento. Use :start primeiro.")
-			return
+		call, total, msg := us.finishRide(session)
+		if msg != "" {
+			if strings.HasPrefix(msg, "[ERRO]") {
+				sendMsg(session.client, msg)
+			} else {
+				sendMsg(session.client, "[RESPOSTA] "+msg)
+			}
+			return true
 		}
-
-		call := session.getCurrentCall()
-
-		if err := us.store.addEarnings(session.name, call.Value); err != nil {
-			sendMsg(client, "[ERRO] Falha ao registrar ganhos. Tente novamente.")
-			return
-		}
-
-		session.setCurrentCall(nil)
-		session.transition(StateIdle)
-
-		sendMsg(client, fmt.Sprintf("[CONFIRMAÇÃO] Você executou: FINALIZAR CORRIDA #%d", call.ID))
-		sendMsg(client, fmt.Sprintf("[INFO] Corrida finalizada! Você ganhou R$ %.2f. Faturamento total: R$ %.2f",
-			call.Value, session.getTotalEarned()))
-		sendMsg(client, "[INFO] Você está livre para novas chamadas.")
+		sendMsg(session.client, fmt.Sprintf("[CONFIRMAÇÃO] Você executou: FINALIZAR CORRIDA #%d", call.ID))
+		sendMsg(session.client, fmt.Sprintf(
+			"[INFO] Corrida finalizada! Você ganhou R$ %.2f. Faturamento total: R$ %.2f",
+			call.Value, total,
+		))
+		sendMsg(session.client, "[INFO] Você está livre para novas chamadas.")
+		return true
 
 	case ":cancel":
-		// transição válida: StateAccepted → StateIdle
-		if state != StateAccepted {
-			if state == StateStarted {
-				sendMsg(client, "[RESPOSTA] Corrida já iniciada. Use :finish para finalizar.")
-			} else {
-				sendMsg(client, "[RESPOSTA] Nenhuma corrida aceita para cancelar.")
-			}
-			return
+		call, msg := us.cancelRide(session)
+		if msg != "" {
+			sendMsg(session.client, "[RESPOSTA] "+msg)
+			return true
 		}
-
-		call := session.getCurrentCall()
-		session.setCurrentCall(nil)
-		session.transition(StateIdle)
-
-		sendMsg(client, fmt.Sprintf("[CONFIRMAÇÃO] Você executou: CANCELAR CORRIDA #%d", call.ID))
-		sendMsg(client, "[INFO] Corrida cancelada. Você está livre para novas chamadas.")
+		sendMsg(session.client, fmt.Sprintf("[CONFIRMAÇÃO] Você executou: CANCELAR CORRIDA #%d", call.ID))
+		sendMsg(session.client, "[INFO] Corrida cancelada. Você está livre para novas chamadas.")
+		return true
 
 	case ":status":
-		call := session.getCurrentCall()
+		state, call, total := us.statusSnapshot(session)
 		extra := ""
 		if call != nil {
 			extra = fmt.Sprintf(" | Corrida #%d | Distância: %.1f km | Valor: R$ %.2f",
 				call.ID, call.RideDistance, call.Value)
 		}
-		sendMsg(client, fmt.Sprintf("[RESPOSTA] Status: %s%s | Faturamento total: R$ %.2f",
-			state.String(), extra, session.getTotalEarned()))
+		sendMsg(session.client, fmt.Sprintf("[RESPOSTA] Status: %s%s | Faturamento total: R$ %.2f",
+			state.String(), extra, total))
+		return true
 
 	case ":quit":
-		sendMsg(client, "[INFO] Encerrando conexão. Até logo, motorista!")
-		cancel()
+		sendMsg(session.client, "[INFO] Encerrando conexão. Até logo, motorista!")
+		return false
 
 	default:
-		sendMsg(client, fmt.Sprintf("[RESPOSTA] Comando desconhecido: %q. Use :accept, :start, :finish, :cancel, :status ou :quit", cmd))
+		sendMsg(session.client, fmt.Sprintf(
+			"[RESPOSTA] Comando desconhecido: %q. Use :accept, :start, :finish, :cancel, :status ou :quit",
+			cmd,
+		))
+		return true
 	}
 }
 
-// thread2GlobalEventGenerator é a única goroutine que gera chamadas.
-// Distribui cada chamada para TODOS os motoristas em StateIdle simultaneamente.
-// Quando um aceita, os outros voltam para StateIdle silenciosamente via tryTake.
-func (us *UberServer) thread2GlobalEventGenerator(ctx context.Context) {
+func (us *UberServer) acceptCall(session *DriverSession) (*Call, string) {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
+	if session.state != StateCallPending || session.currentCall == nil {
+		return nil, "Nenhuma chamada pendente para aceitar."
+	}
+
+	call := session.currentCall
+
+	if us.activeCall != call {
+		session.currentCall = nil
+		session.state = StateIdle
+		return nil, "A chamada já foi aceita por outro motorista."
+	}
+
+	if time.Now().After(call.ExpiresAt) {
+		for _, other := range us.sessions {
+			if other.state == StateCallPending && other.currentCall == call {
+				other.currentCall = nil
+				other.state = StateIdle
+			}
+		}
+		us.activeCall = nil
+		return nil, "Tempo esgotado para aceitar esta chamada."
+	}
+
+	session.state = StateAccepted
+	us.activeCall = nil
+
+	for _, other := range us.sessions {
+		if other != session && other.state == StateCallPending && other.currentCall == call {
+			other.currentCall = nil
+			other.state = StateIdle
+		}
+	}
+
+	return call, ""
+}
+
+func (us *UberServer) startRide(session *DriverSession) (*Call, string) {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
+	if session.state != StateAccepted || session.currentCall == nil {
+		return nil, "Nenhuma corrida aceita para iniciar. Use :accept primeiro."
+	}
+
+	session.state = StateStarted
+	return session.currentCall, ""
+}
+
+func (us *UberServer) finishRide(session *DriverSession) (*Call, float64, string) {
+	us.mu.Lock()
+	if session.state != StateStarted || session.currentCall == nil {
+		us.mu.Unlock()
+		return nil, 0, "Nenhuma corrida em andamento. Use :start primeiro."
+	}
+	call := session.currentCall
+	us.mu.Unlock()
+
+	total, err := us.store.addEarnings(session.name, call.Value)
+	if err != nil {
+		return nil, 0, "[ERRO] Falha ao registrar ganhos. Tente novamente."
+	}
+
+	us.mu.Lock()
+	session.currentCall = nil
+	session.state = StateIdle
+	us.mu.Unlock()
+
+	return call, total, ""
+}
+
+func (us *UberServer) cancelRide(session *DriverSession) (*Call, string) {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
+	if session.state == StateStarted {
+		return nil, "Corrida já iniciada. Use :finish para finalizar."
+	}
+	if session.state != StateAccepted || session.currentCall == nil {
+		return nil, "Nenhuma corrida aceita para cancelar."
+	}
+
+	call := session.currentCall
+	session.currentCall = nil
+	session.state = StateIdle
+
+	return call, ""
+}
+
+func (us *UberServer) statusSnapshot(session *DriverSession) (SessionState, *Call, float64) {
+	us.mu.Lock()
+	state := session.state
+	var callCopy *Call
+	if session.currentCall != nil {
+		c := *session.currentCall
+		callCopy = &c
+	}
+	us.mu.Unlock()
+
+	total := us.store.totalEarned(session.name)
+	return state, callCopy, total
+}
+
+func (us *UberServer) eventLoop(ctx context.Context) {
 	callTimer := time.NewTimer(randomDuration(15, 20))
 	defer callTimer.Stop()
 
@@ -489,128 +559,113 @@ func (us *UberServer) thread2GlobalEventGenerator(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-
 		case <-callTimer.C:
 			us.generateAndDispatch()
 			callTimer.Reset(randomDuration(15, 20))
-
 		case <-checkTicker.C:
 			us.checkActiveCallExpiry()
 		}
 	}
 }
 
-// generateAndDispatch gera uma nova chamada e a envia para todos os motoristas livres.
-// Só gera se não houver chamada ativa no momento.
 func (us *UberServer) generateAndDispatch() {
-	us.activeCallMu.Lock()
-	// se já há uma chamada ativa (pendente), não gera outra
-	if us.activeCall != nil && !us.activeCall.isTaken() {
-		us.activeCallMu.Unlock()
-		return
-	}
-
-	// gera nova chamada global
-	us.counterMu.Lock()
-	us.callCounter++
-	id := us.callCounter
-	us.counterMu.Unlock()
-
-	call := &GlobalCall{
-		ID:           id,
+	call := &Call{
 		DistToPickup: randomFloat(0.5, 8.0),
 		RideDistance: randomFloat(2.0, 25.0),
 		ExpiresAt:    time.Now().Add(15 * time.Second),
 	}
 	call.Value = call.RideDistance*1.5 + randomFloat(2.0, 8.0)
+
+	var recipients []*tcp.Client
+
+	us.mu.Lock()
+	if us.activeCall != nil {
+		us.mu.Unlock()
+		return
+	}
+
+	us.nextCallID++
+	call.ID = us.nextCallID
 	us.activeCall = call
-	us.activeCallMu.Unlock()
 
-	// distribui para todos os motoristas em StateIdle
-	count := 0
-	us.sessions.Range(func(_, val any) bool {
-		session := val.(*DriverSession)
-		if session.getState() == StateIdle {
-			// transição: StateIdle → StateCallPending
-			session.setCurrentCall(call)
-			session.transition(StateCallPending)
-
-			sendMsg(session.client, fmt.Sprintf(
-				"\n[NOVA CHAMADA #%d] Passageiro a %.1f km | Corrida: %.1f km | Valor: R$ %.2f | Tempo para aceitar: 15s",
-				call.ID, call.DistToPickup, call.RideDistance, call.Value,
-			))
-			count++
+	for _, session := range us.sessions {
+		if session.state == StateIdle {
+			session.state = StateCallPending
+			session.currentCall = call
+			recipients = append(recipients, session.client)
 		}
-		return true
-	})
+	}
 
-	if count == 0 {
-		// nenhum motorista livre — descarta a chamada
-		us.activeCallMu.Lock()
+	if len(recipients) == 0 {
 		us.activeCall = nil
-		us.activeCallMu.Unlock()
+	}
+	us.mu.Unlock()
+
+	for _, client := range recipients {
+		sendMsg(client, fmt.Sprintf(
+			"\n[NOVA CHAMADA #%d] Passageiro a %.1f km | Corrida: %.1f km | Valor: R$ %.2f | Tempo para aceitar: 15s",
+			call.ID, call.DistToPickup, call.RideDistance, call.Value,
+		))
 	}
 }
-
-// checkActiveCallExpiry verifica se a chamada ativa expirou.
-// Retorna os motoristas em StateCallPending para StateIdle e decide se cancela ou aumenta o valor.
 
 func (us *UberServer) checkActiveCallExpiry() {
-	us.activeCallMu.Lock()
+	type outbound struct {
+		client *tcp.Client
+		msg    string
+	}
+
+	var outs []outbound
+
+	us.mu.Lock()
 	call := us.activeCall
-	us.activeCallMu.Unlock()
-
-	if call == nil || call.isTaken() {
+	if call == nil || time.Now().Before(call.ExpiresAt) {
+		us.mu.Unlock()
 		return
 	}
 
-	if !time.Now().After(call.ExpiresAt) {
-		return
-	}
-
-	// 50% cancela, 50% aumenta o valor e renova o prazo
 	if rand.Intn(2) == 0 {
-		// cancela: volta todos os motoristas em StateCallPending para StateIdle
-		us.sessions.Range(func(_, val any) bool {
-			session := val.(*DriverSession)
-			if session.getState() == StateCallPending {
-				call := session.getCurrentCall()
-				if call != nil {
-					sendMsg(session.client, fmt.Sprintf("[AVISO] CHAMADA #%d: Tempo esgotado. Corrida cancelada.", call.ID))
-				}
-				session.setCurrentCall(nil)
-				session.transition(StateIdle)
+		for _, session := range us.sessions {
+			if session.state == StateCallPending && session.currentCall == call {
+				session.currentCall = nil
+				session.state = StateIdle
+				outs = append(outs, outbound{
+					client: session.client,
+					msg:    fmt.Sprintf("[AVISO] CHAMADA #%d: Tempo esgotado. Corrida cancelada.", call.ID),
+				})
 			}
-			return true
-		})
-
-		us.activeCallMu.Lock()
+		}
 		us.activeCall = nil
-		us.activeCallMu.Unlock()
+		us.mu.Unlock()
 
-	} else {
-		// aumenta o valor e renova o prazo para todos ainda pendentes
-		bonus := rand.Float64()*5 + 2
-		call.mu.Lock()
-		call.Value += bonus
-		call.ExpiresAt = time.Now().Add(15 * time.Second)
-		newValue := call.Value
-		call.mu.Unlock()
+		for _, out := range outs {
+			sendMsg(out.client, out.msg)
+		}
+		return
+	}
 
-		us.sessions.Range(func(_, val any) bool {
-			session := val.(*DriverSession)
-			if session.getState() == StateCallPending {
-				sendMsg(session.client, fmt.Sprintf(
+	bonus := rand.Float64()*5 + 2
+	call.Value += bonus
+	call.ExpiresAt = time.Now().Add(15 * time.Second)
+	newValue := call.Value
+
+	for _, session := range us.sessions {
+		if session.state == StateCallPending && session.currentCall == call {
+			outs = append(outs, outbound{
+				client: session.client,
+				msg: fmt.Sprintf(
 					"[VALOR AUMENTADO] CHAMADA #%d: Valor aumentado para R$ %.2f. Mais 15s para aceitar.",
 					call.ID, newValue,
-				))
-			}
-			return true
-		})
+				),
+			})
+		}
+	}
+	us.mu.Unlock()
+
+	for _, out := range outs {
+		sendMsg(out.client, out.msg)
 	}
 }
-
-// Helpers
 
 func sendMsg(client *tcp.Client, msg string) {
 	_ = client.SendFrame([]byte(msg))
