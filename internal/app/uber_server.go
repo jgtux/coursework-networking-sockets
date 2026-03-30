@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"fmt"
@@ -14,7 +15,6 @@ import (
 
 	"coursework-networking-sockets/internal/tcp"
 )
-
 
 // Maquina de estados finita (FSM)
 type SessionState int
@@ -41,11 +41,10 @@ func (s SessionState) String() string {
 	}
 }
 
-
 // Armazenamento dos dados dos motoristas com sqlite
 // colocar .env
 const (
-	dataDir = "data"
+	dataDir  = "data"
 	dataFile = "data/drivers.db"
 )
 
@@ -198,7 +197,6 @@ type Call struct {
 	ExpiresAt    time.Time
 }
 
-
 // Sessao de um motorista
 type DriverSession struct {
 	serverKey   string
@@ -212,11 +210,161 @@ type DriverSession struct {
 type UberServer struct {
 	mu         sync.Mutex
 	store      *DriverStore
+	maxClients int
 	sessions   map[string]*DriverSession // nome -> sessão
 	nextCallID int
 	activeCall *Call
 }
 
+// Funções auxiliares para terminal administrativo/testes
+type sessionSnapshot struct {
+	Name  string
+	State string
+	Call  *Call
+}
+
+func (us *UberServer) connectedNames() []string {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
+	names := make([]string, 0, len(us.sessions))
+	for name := range us.sessions {
+		names = append(names, name)
+	}
+	return names
+}
+
+func (us *UberServer) connectedCount() int {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+	return len(us.sessions)
+}
+
+func (us *UberServer) availableSlots() int {
+	used := us.connectedCount()
+	free := us.maxClients - used
+	if free < 0 {
+		return 0
+	}
+	return free
+}
+
+func (us *UberServer) sessionSnapshots() []sessionSnapshot {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
+	out := make([]sessionSnapshot, 0, len(us.sessions))
+	for _, s := range us.sessions {
+		snap := sessionSnapshot{
+			Name:  s.name,
+			State: s.state.String(),
+		}
+		if s.currentCall != nil {
+			c := *s.currentCall
+			snap.Call = &c
+		}
+		out = append(out, snap)
+	}
+	return out
+}
+
+func (us *UberServer) activeCallSnapshot() *Call {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
+	if us.activeCall == nil {
+		return nil
+	}
+	c := *us.activeCall
+	return &c
+}
+
+// Terminal administrativo para monitorar o servidor
+func (us *UberServer) adminConsole(ctx context.Context) {
+	scanner := bufio.NewScanner(os.Stdin)
+
+	fmt.Println("[ADMIN] Console iniciado. Use :help.")
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("[ADMIN] Console encerrado.")
+			return
+		default:
+		}
+
+		fmt.Print("[ADMIN] > ")
+		if !scanner.Scan() {
+			fmt.Println("[ADMIN] Entrada encerrada.")
+			return
+		}
+
+		cmd := strings.TrimSpace(strings.ToLower(scanner.Text()))
+
+		switch cmd {
+		case ":help":
+			fmt.Println("Comandos:")
+			fmt.Println("  :clients   -> lista motoristas conectados")
+			fmt.Println("  :slots     -> mostra vagas usadas/livres")
+			fmt.Println("  :state     -> mostra estado das sessões")
+			fmt.Println("  :active    -> mostra a chamada ativa")
+			fmt.Println("  :quitadmin -> encerra o console admin")
+
+		case ":clients":
+			names := us.connectedNames()
+			if len(names) == 0 {
+				fmt.Println("[ADMIN] Nenhum motorista conectado.")
+				continue
+			}
+			fmt.Printf("[ADMIN] Motoristas conectados (%d):\n", len(names))
+			for _, name := range names {
+				fmt.Printf(" - %s\n", name)
+			}
+
+		case ":slots":
+			used := us.connectedCount()
+			free := us.availableSlots()
+			fmt.Printf("[ADMIN] Conectados: %d | Livres: %d | Máximo: %d\n",
+				used, free, us.maxClients)
+
+		case ":state":
+			snaps := us.sessionSnapshots()
+			if len(snaps) == 0 {
+				fmt.Println("[ADMIN] Nenhum motorista conectado.")
+				continue
+			}
+			fmt.Println("[ADMIN] Estado das sessões:")
+			for _, s := range snaps {
+				if s.Call != nil {
+					fmt.Printf(" - %s -> %s | Corrida #%d | Valor: R$ %.2f\n",
+						s.Name, s.State, s.Call.ID, s.Call.Value)
+				} else {
+					fmt.Printf(" - %s -> %s\n", s.Name, s.State)
+				}
+			}
+
+		case ":active":
+			call := us.activeCallSnapshot()
+			if call == nil {
+				fmt.Println("[ADMIN] Nenhuma chamada ativa no momento.")
+				continue
+			}
+			remaining := time.Until(call.ExpiresAt).Round(time.Second)
+			if remaining < 0 {
+				remaining = 0
+			}
+			fmt.Printf("[ADMIN] Chamada ativa #%d | Passageiro: %.1f km | Corrida: %.1f km | Valor: R$ %.2f | Expira em: %s\n",
+				call.ID, call.DistToPickup, call.RideDistance, call.Value, remaining)
+
+		case ":quitadmin":
+			fmt.Println("[ADMIN] Encerrando console admin.")
+			return
+
+		default:
+			fmt.Println("[ADMIN] Comando desconhecido. Use :help")
+		}
+	}
+}
 
 // Init Uber server
 func RunUberServer(ctx context.Context, addr string, maxClients int) error {
@@ -224,6 +372,7 @@ func RunUberServer(ctx context.Context, addr string, maxClients int) error {
 	if err != nil {
 		return fmt.Errorf("erro ao carregar dados: %w", err)
 	}
+	defer store.Close()
 
 	srv, err := tcp.NewServer(ctx, addr, maxClients)
 	if err != nil {
@@ -232,11 +381,13 @@ func RunUberServer(ctx context.Context, addr string, maxClients int) error {
 	defer srv.Close()
 
 	us := &UberServer{
-		store:    store,
-		sessions: make(map[string]*DriverSession),
+		store:      store,
+		maxClients: maxClients,
+		sessions:   make(map[string]*DriverSession),
 	}
 
 	go us.eventLoop(ctx)
+	go us.adminConsole(ctx)
 
 	fmt.Printf("[SERVER] Aguardando conexões em %s (max %d motoristas)...\n", addr, maxClients)
 

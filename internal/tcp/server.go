@@ -173,33 +173,6 @@ func (s *Server) RemoveClient(key string) {
 	}
 }
 
-// BroadcastFrame envia um frame para todos os clientes conectados
-func (s *Server) BroadcastFrame(payload []byte) {
-	s.clientsMu.RLock()
-	clients := make([]*Client, 0, len(s.clients))
-	for _, client := range s.clients {
-		clients = append(clients, client)
-	}
-	s.clientsMu.RUnlock()
-
-	for _, client := range clients {
-		_ = client.SendFrame(payload)
-	}
-}
-
-// RangeClients itera sobre os clientes conectados de forma thread-safe.
-// Retorne false na função fn para parar a iteração.
-func (s *Server) RangeClients(fn func(key string, c *Client) bool) {
-	s.clientsMu.RLock()
-	defer s.clientsMu.RUnlock()
-
-	for k, c := range s.clients {
-		if !fn(k, c) {
-			return
-		}
-	}
-}
-
 // Close encerra o servidor — só executa na primeira chamada (sync.Once)
 func (s *Server) Close() error {
 	var err error
