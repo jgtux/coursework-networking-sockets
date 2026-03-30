@@ -210,7 +210,6 @@ type DriverSession struct {
 type UberServer struct {
 	mu         sync.Mutex
 	store      *DriverStore
-	srv        *tcp.Server
 	maxClients int
 	sessions   map[string]*DriverSession // nome -> sessão
 	nextCallID int
@@ -373,6 +372,7 @@ func RunUberServer(ctx context.Context, addr string, maxClients int) error {
 	if err != nil {
 		return fmt.Errorf("erro ao carregar dados: %w", err)
 	}
+	defer store.Close()
 
 	srv, err := tcp.NewServer(ctx, addr, maxClients)
 	if err != nil {
@@ -382,7 +382,6 @@ func RunUberServer(ctx context.Context, addr string, maxClients int) error {
 
 	us := &UberServer{
 		store:      store,
-		srv:        srv,
 		maxClients: maxClients,
 		sessions:   make(map[string]*DriverSession),
 	}
