@@ -42,7 +42,6 @@ func (s SessionState) String() string {
 }
 
 // Armazenamento dos dados dos motoristas com sqlite
-// colocar .env
 const (
 	dataDir  = "data"
 	dataFile = "data/drivers.db"
@@ -63,7 +62,7 @@ func loadStore() (*DriverStore, error) {
 		return nil, fmt.Errorf("erro ao criar pasta data: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", dataFile)
+	db, err := sql.Open("sqlite", dataFile) //abre e cria os data drivers
 	if err != nil {
 		return nil, fmt.Errorf("erro ao abrir banco sqlite: %w", err)
 	}
@@ -195,6 +194,7 @@ type Call struct {
 	RideDistance float64
 	Value        float64
 	ExpiresAt    time.Time
+	ValueBumped  bool
 }
 
 // Sessao de um motorista
@@ -211,7 +211,7 @@ type UberServer struct {
 	mu         sync.Mutex
 	store      *DriverStore
 	maxClients int
-	sessions   map[string]*DriverSession // nome -> sessão
+	sessions   map[string]*DriverSession
 	nextCallID int
 	activeCall *Call
 }
@@ -223,6 +223,7 @@ type sessionSnapshot struct {
 	Call  *Call
 }
 
+// Mostra nome dos motoristas
 func (us *UberServer) connectedNames() []string {
 	us.mu.Lock()
 	defer us.mu.Unlock()
@@ -234,12 +235,14 @@ func (us *UberServer) connectedNames() []string {
 	return names
 }
 
+// Numero de sessões ativas
 func (us *UberServer) connectedCount() int {
 	us.mu.Lock()
 	defer us.mu.Unlock()
 	return len(us.sessions)
 }
 
+// Vaga livre
 func (us *UberServer) availableSlots() int {
 	used := us.connectedCount()
 	free := us.maxClients - used
@@ -249,6 +252,7 @@ func (us *UberServer) availableSlots() int {
 	return free
 }
 
+// Estado das sessões
 func (us *UberServer) sessionSnapshots() []sessionSnapshot {
 	us.mu.Lock()
 	defer us.mu.Unlock()
@@ -268,6 +272,7 @@ func (us *UberServer) sessionSnapshots() []sessionSnapshot {
 	return out
 }
 
+// Chamada ativa
 func (us *UberServer) activeCallSnapshot() *Call {
 	us.mu.Lock()
 	defer us.mu.Unlock()
@@ -386,8 +391,8 @@ func RunUberServer(ctx context.Context, addr string, maxClients int) error {
 		sessions:   make(map[string]*DriverSession),
 	}
 
-	go us.eventLoop(ctx)
-	go us.adminConsole(ctx)
+	go us.eventLoop(ctx)    //Goroutine para cuidar da geração de chamadas e expiração
+	go us.adminConsole(ctx) //Goroutine para console administrativo
 
 	fmt.Printf("[SERVER] Aguardando conexões em %s (max %d motoristas)...\n", addr, maxClients)
 
@@ -495,7 +500,7 @@ func (us *UberServer) handleSession(ctx context.Context, srv *tcp.Server, key st
 	}
 }
 
-// Remove uma sessao
+// Remove uma sessao quando o motorista desconecta
 func (us *UberServer) removeSession(session *DriverSession) {
 	us.mu.Lock()
 	defer us.mu.Unlock()
@@ -519,7 +524,7 @@ func (us *UberServer) removeSession(session *DriverSession) {
 	}
 }
 
-// Cuida dos casos de comandos por sessao
+// Cuida dos casos de comandos de sessao
 func (us *UberServer) handleCommand(session *DriverSession, cmd string) bool {
 	switch cmd {
 	case ":accept":
@@ -601,8 +606,7 @@ func (us *UberServer) handleCommand(session *DriverSession, cmd string) bool {
 	}
 }
 
-// Comandos
-
+// Comandos motorista
 func (us *UberServer) acceptCall(session *DriverSession) (*Call, string) {
 	us.mu.Lock()
 	defer us.mu.Unlock()
@@ -643,6 +647,7 @@ func (us *UberServer) acceptCall(session *DriverSession) (*Call, string) {
 	return call, ""
 }
 
+// O motorista só pode iniciar a corrida se tiver aceitado uma chamada
 func (us *UberServer) startRide(session *DriverSession) (*Call, string) {
 	us.mu.Lock()
 	defer us.mu.Unlock()
@@ -655,6 +660,7 @@ func (us *UberServer) startRide(session *DriverSession) (*Call, string) {
 	return session.currentCall, ""
 }
 
+// O motorista só pode finalizar a corrida se tiver iniciado uma chamada
 func (us *UberServer) finishRide(session *DriverSession) (*Call, float64, string) {
 	us.mu.Lock()
 	if session.state != StateStarted || session.currentCall == nil {
@@ -677,6 +683,7 @@ func (us *UberServer) finishRide(session *DriverSession) (*Call, float64, string
 	return call, total, ""
 }
 
+// O motorista pode cancelar uma chamada se aceita e antes de iniciar a corrida
 func (us *UberServer) cancelRide(session *DriverSession) (*Call, string) {
 	us.mu.Lock()
 	defer us.mu.Unlock()
@@ -695,6 +702,7 @@ func (us *UberServer) cancelRide(session *DriverSession) (*Call, string) {
 	return call, ""
 }
 
+// O motorista pode verificar o status atual
 func (us *UberServer) statusSnapshot(session *DriverSession) (SessionState, *Call, float64) {
 	us.mu.Lock()
 	state := session.state
@@ -709,31 +717,31 @@ func (us *UberServer) statusSnapshot(session *DriverSession) (SessionState, *Cal
 	return state, callCopy, total
 }
 
+// Gerencia o loop de eventos do servidor, como geração de chamadas e expiração
 func (us *UberServer) eventLoop(ctx context.Context) {
-	callTimer := time.NewTimer(randomDuration(15, 20))
+	callTimer := time.NewTimer(10 * time.Second)
 	defer callTimer.Stop()
-
 	checkTicker := time.NewTicker(1 * time.Second)
 	defer checkTicker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-callTimer.C:
 			us.generateAndDispatch()
-			callTimer.Reset(randomDuration(15, 20))
+			callTimer.Reset(10 * time.Second)
 		case <-checkTicker.C:
 			us.checkActiveCallExpiry()
 		}
 	}
 }
 
+// Gera uma nova chamada e notifica os motoristas disponíveis
 func (us *UberServer) generateAndDispatch() {
 	call := &Call{
 		DistToPickup: randomFloat(0.5, 8.0),
 		RideDistance: randomFloat(2.0, 25.0),
-		ExpiresAt:    time.Now().Add(15 * time.Second),
+		ExpiresAt:    time.Now().Add(12 * time.Second),
 	}
 	call.Value = call.RideDistance*1.5 + randomFloat(2.0, 8.0)
 
@@ -764,12 +772,13 @@ func (us *UberServer) generateAndDispatch() {
 
 	for _, client := range recipients {
 		sendMsg(client, fmt.Sprintf(
-			"\n[NOVA CHAMADA #%d] Passageiro a %.1f km | Corrida: %.1f km | Valor: R$ %.2f | Tempo para aceitar: 15s",
+			"\n[NOVA CHAMADA #%d] Passageiro a %.1f km | Corrida: %.1f km | Valor: R$ %.2f | Tempo para aceitar: 12s",
 			call.ID, call.DistToPickup, call.RideDistance, call.Value,
 		))
 	}
 }
 
+// Verifica se a chamada ativa expirou e notifica os motoristas
 func (us *UberServer) checkActiveCallExpiry() {
 	type outbound struct {
 		client *tcp.Client
@@ -785,7 +794,10 @@ func (us *UberServer) checkActiveCallExpiry() {
 		return
 	}
 
-	if rand.Intn(2) == 0 {
+	//65% aumenta, 35% cancela
+	shouldCancel := call.ValueBumped || rand.Intn(100) < 35
+
+	if shouldCancel {
 		for _, session := range us.sessions {
 			if session.state == StateCallPending && session.currentCall == call {
 				session.currentCall = nil
@@ -805,9 +817,11 @@ func (us *UberServer) checkActiveCallExpiry() {
 		return
 	}
 
+	//Se o valor foi aumentado só pode ter a opção de cancelar depois
 	bonus := rand.Float64()*5 + 2
 	call.Value += bonus
-	call.ExpiresAt = time.Now().Add(15 * time.Second)
+	call.ExpiresAt = time.Now().Add(10 * time.Second)
+	call.ValueBumped = true
 	newValue := call.Value
 
 	for _, session := range us.sessions {
@@ -815,7 +829,7 @@ func (us *UberServer) checkActiveCallExpiry() {
 			outs = append(outs, outbound{
 				client: session.client,
 				msg: fmt.Sprintf(
-					"[VALOR AUMENTADO] CHAMADA #%d: Valor aumentado para R$ %.2f. Mais 15s para aceitar.",
+					"[VALOR AUMENTADO] CHAMADA #%d: Valor aumentado para R$ %.2f. Mais 10s para aceitar.",
 					call.ID, newValue,
 				),
 			})
@@ -828,6 +842,7 @@ func (us *UberServer) checkActiveCallExpiry() {
 	}
 }
 
+// Helpers
 func sendMsg(client *tcp.Client, msg string) {
 	_ = client.SendFrame([]byte(msg))
 }

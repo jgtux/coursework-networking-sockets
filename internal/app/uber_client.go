@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"time"
 	"strings"
+	"time"
 
 	"coursework-networking-sockets/internal/tcp"
 )
@@ -34,12 +34,11 @@ func RunUberClient(ctx context.Context, addr string) error {
 	sessCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go recvLoop(sessCtx, client, cancel)
-	readInput(sessCtx, client, cancel)
+	go recvLoop(sessCtx, client, cancel) //Goroutine para receber mensagens do servidor
+	readInput(sessCtx, client, cancel)   //Goroutine para ler comandos do usuário e enviar para o servidor
 
 	return nil
 }
-
 
 func login(client *tcp.Client) error {
 	frame, err := client.ReadFrame()
