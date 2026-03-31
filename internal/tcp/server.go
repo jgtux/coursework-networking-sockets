@@ -8,24 +8,34 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 type ErrReason string
 
-const (
-	ErrServerFull ErrReason = "SERVER_FULL"
-)
-
-// para implementar a interface do error
 func (e ErrReason) Error() string {
 	return string(e)
 }
+
+const (
+	ErrServerFull   ErrReason = "SERVER_FULL"
+	ErrAcceptFailed ErrReason = "ACCEPT_FAIL"
+)
+
+
+const (
+	// timeouts padrao aplicados aos clientes aceitos pelo servidor
+	DefaultAcceptedClientReadTimeout  = 30 * time.Second
+	DefaultAcceptedClientWriteTimeout = 10 * time.Second
+
+	// timeout menor para responder "server full" e fechar
+	DefaultRejectWriteTimeout = 2 * time.Second
+)
 
 type AcceptedClient struct {
 	Key    string
 	Client *Client
 }
-
 
 // struct server
 type Server struct {
@@ -38,9 +48,8 @@ type Server struct {
 	clients   map[string]*Client
 	clientsMu sync.RWMutex
 
-	errs chan error
+	errs     chan error
 	accepted chan AcceptedClient
-
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -55,7 +64,7 @@ func NewServer(parent context.Context, addr string, maxClients int) (*Server, er
 		parent = context.Background()
 	}
 	if maxClients <= 0 {
-		return nil, fmt.Errorf("atleast 1 client slot must be available")
+		return nil, fmt.Errorf("Pelo menos 1 slot deve estar disponivel.")
 	}
 
 	ln, err := net.Listen("tcp", addr)
@@ -88,6 +97,17 @@ func NewServer(parent context.Context, addr string, maxClients int) (*Server, er
 	return s, nil
 }
 
+func (s *Server) trySendErr(err error) {
+	if err == nil {
+		return
+	}
+
+	select {
+	case s.errs <- err:
+	default:
+	}
+}
+
 // loop para lidar com novas conexoes
 func (s *Server) acceptLoop() {
 	defer close(s.errs)
@@ -106,26 +126,28 @@ func (s *Server) acceptLoop() {
 				return
 			}
 
-			select {
-			case s.errs <- err:
-			default:
-			}
+			s.trySendErr(fmt.Errorf("%w: erro ao aceitar conexão: %w", ErrAcceptFailed, err))
 			return
 		}
 
 		client := NewClient(conn)
+		client.SetReadTimeout(DefaultAcceptedClientReadTimeout)
+		client.SetWriteTimeout(DefaultAcceptedClientWriteTimeout)
 
 		// tenta pegar 1 slot do semáforo; se cheio, recusa
 		select {
 		case s.sem <- struct{}{}:
 			// ok, tem vaga
+
 		default:
+			client.SetWriteTimeout(DefaultRejectWriteTimeout)
 			_ = client.SendFrame([]byte(ErrServerFull))
 			_ = client.Close()
 			continue
 		}
 
 		key := s.newClientKey()
+
 		s.clientsMu.Lock()
 		s.clients[key] = client
 		s.clientsMu.Unlock()
@@ -179,7 +201,11 @@ func (s *Server) Close() error {
 
 	s.once.Do(func() {
 		s.cancel()
-		err = s.ln.Close()
+
+		// pode ja ter sido fechado pela goroutine que escuta ctx.Done()
+		if cerr := s.ln.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+			err = cerr
+		}
 
 		s.clientsMu.Lock()
 		clients := make([]*Client, 0, len(s.clients))
@@ -191,6 +217,7 @@ func (s *Server) Close() error {
 
 		for _, client := range clients {
 			_ = client.Close()
+
 			select {
 			case <-s.sem:
 			default:

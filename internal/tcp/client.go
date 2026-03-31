@@ -8,8 +8,20 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
+
+const (
+	ErrFrameTooLarge    ErrReason = "FRAME_TOO_LARGE"
+	ErrDeadlineExceeded ErrReason = "DEADLINE_EXCEEDED"
+	ErrReadTimeout      ErrReason = "READ_TIMEOUT"
+	ErrWriteTimeout     ErrReason = "WRITE_TIMEOUT"
+	ErrConnClosed       ErrReason = "CONN_CLOSED"
+	ErrReadFailed       ErrReason = "READ_FAIL"
+	ErrWriteFailed      ErrReason = "WRITE_FAIL"
+)
+
 
 // timeouts padrao por operacao (0 = sem timeout)
 // max tamanho de frame padrao
@@ -18,6 +30,7 @@ const (
 	DefaultWriteTimeout        = 0 * time.Second
 	DefaultMaxFrameSize uint32 = 1 << 20 // 1 MiB
 )
+
 
 // struct client
 type Client struct {
@@ -64,7 +77,7 @@ func (c *Client) ReadFrame() ([]byte, error) {
 
 	// le exatamente os 4 bytes do cabecalho
 	if _, err := io.ReadFull(c.conn, header[:]); err != nil {
-		return nil, wrapTimeout("read header", err)
+		return nil, wrapReadError("read header", err)
 	}
 
 	// converte os 4 bytes para uint32
@@ -72,7 +85,7 @@ func (c *Client) ReadFrame() ([]byte, error) {
 
 	// valida o tamanho maximo permitido
 	if size > c.maxFrameSize {
-		return nil, fmt.Errorf("frame too large: %d > %d", size, c.maxFrameSize)
+		return nil, fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, size, c.maxFrameSize)
 	}
 
 	// cria buffer com o tamanho informado no cabecalho
@@ -80,7 +93,7 @@ func (c *Client) ReadFrame() ([]byte, error) {
 
 	// le exatamente o payload inteiro
 	if _, err := io.ReadFull(c.conn, payload); err != nil {
-		return nil, wrapTimeout("read payload", err)
+		return nil, wrapReadError("read payload", err)
 	}
 
 	return payload, nil
@@ -93,7 +106,7 @@ func (c *Client) ReadFrame() ([]byte, error) {
 func (c *Client) SendFrame(payload []byte) error {
 	// valida se o payload nao excede o tamanho maximo permitido
 	if len(payload) > int(c.maxFrameSize) {
-		return fmt.Errorf("frame too large: %d > %d", len(payload), c.maxFrameSize)
+		return fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, len(payload), c.maxFrameSize)
 	}
 
 	var header [4]byte
@@ -113,12 +126,12 @@ func (c *Client) SendFrame(payload []byte) error {
 
 	// envia primeiro o cabecalho
 	if err := writeFull(c.conn, header[:]); err != nil {
-		return wrapTimeout("write header", err)
+		return wrapWriteError("write header", err)
 	}
 
 	// depois envia o payload
 	if err := writeFull(c.conn, payload); err != nil {
-		return wrapTimeout("write payload", err)
+		return wrapWriteError("write payload", err)
 	}
 
 	return nil
@@ -174,15 +187,48 @@ func IsTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
-// helper para padronizar mensagem em caso de timeout
-func wrapTimeout(where string, err error) error {
+// helper para identificar conexao fechada/resetada
+func IsConnClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET)
+}
+
+
+func wrapReadError(where string, err error) error {
 	if err == nil {
 		return nil
 	}
 
 	if IsTimeout(err) {
-		return fmt.Errorf("%s timeout: %w", where, err)
+		return fmt.Errorf("%w: erro de leitura (%s): %w", ErrReadTimeout, where, err)
 	}
 
-	return err
+	if IsConnClosed(err) {
+		return fmt.Errorf("%w: conexão encerrada durante leitura (%s): %w", ErrConnClosed, where, err)
+	}
+
+	return fmt.Errorf("%w: erro de leitura (%s): %w", ErrReadFailed, where, err)
+}
+
+func wrapWriteError(where string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if IsTimeout(err) {
+		return fmt.Errorf("%w: erro de escrita (%s): %w", ErrWriteTimeout, where, err)
+	}
+
+	if IsConnClosed(err) {
+		return fmt.Errorf("%w: conexão encerrada durante escrita (%s): %w", ErrConnClosed, where, err)
+	}
+
+	return fmt.Errorf("%w: erro de escrita (%s): %w", ErrWriteFailed, where, err)
 }
