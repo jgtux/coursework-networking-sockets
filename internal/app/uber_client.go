@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 	"strings"
 
 	"coursework-networking-sockets/internal/tcp"
@@ -39,6 +40,7 @@ func RunUberClient(ctx context.Context, addr string) error {
 	return nil
 }
 
+
 func login(client *tcp.Client) error {
 	frame, err := client.ReadFrame()
 	if err != nil {
@@ -51,24 +53,40 @@ func login(client *tcp.Client) error {
 	}
 
 	fmt.Println(msg)
+	fmt.Println("[INFO] Você tem 30 segundos para informar o nome.")
 
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Print("Nome de usuário: ")
-	if !scanner.Scan() {
-		return fmt.Errorf("entrada encerrada")
-	}
+	inputCh := make(chan string, 1)
+	errCh := make(chan error, 1)
 
-	name := strings.TrimSpace(scanner.Text())
-	if name == "" {
-		return fmt.Errorf("nome não pode ser vazio")
-	}
+	go func() {
+		fmt.Print("Nome de usuário: ")
+		if !scanner.Scan() {
+			errCh <- fmt.Errorf("entrada encerrada")
+			return
+		}
+		inputCh <- strings.TrimSpace(scanner.Text())
+	}()
 
-	if err := client.SendFrame([]byte(name)); err != nil {
-		return fmt.Errorf("falha ao enviar nome: %w", err)
-	}
+	select {
+	case err := <-errCh:
+		return err
 
-	printHelp()
-	return nil
+	case name := <-inputCh:
+		if name == "" {
+			return fmt.Errorf("nome não pode ser vazio")
+		}
+
+		if err := client.SendFrame([]byte(name)); err != nil {
+			return fmt.Errorf("falha ao enviar nome: %w", err)
+		}
+
+		printHelp()
+		return nil
+
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("tempo esgotado para informar o nome")
+	}
 }
 
 func readInput(ctx context.Context, client *tcp.Client, cancel context.CancelFunc) {

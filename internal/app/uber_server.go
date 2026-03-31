@@ -454,6 +454,9 @@ func (us *UberServer) handleSession(ctx context.Context, srv *tcp.Server, key st
 		sendMsg(client, fmt.Sprintf("[ERRO] O nome %q já está em uso. Desconectando.", name))
 		return
 	}
+
+	client.SetReadTimeout(0)
+
 	us.sessions[name] = session
 	us.mu.Unlock()
 
@@ -480,7 +483,7 @@ func (us *UberServer) handleSession(ctx context.Context, srv *tcp.Server, key st
 
 		frame, err := client.ReadFrame()
 		if err != nil {
-			fmt.Printf("[SERVER] Motorista %q desconectou.\n", name)
+			fmt.Printf("[SERVER] Motorista %q saiu por erro: %v\n", name, err)
 			return
 		}
 
